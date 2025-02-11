@@ -1,38 +1,23 @@
-"""Run with: python -m synflownet.tasks.preference_backward"""
-
-from itertools import cycle
-import pickle
-import os
-import time
 import numpy as np
 import torch
 from torch.utils.data import IterableDataset
 import torch_geometric.data as gd
-from torch_scatter import scatter
 from rdkit import Chem
-from rdkit.Chem.Scaffolds import MurckoScaffold
 
 from synflownet import ObjectProperties, LogScalar
-from synflownet.envs.synthesis_building_env import ReactionTemplateEnvContext
-from synflownet.envs.graph_building_env import Graph, GraphAction, GraphActionType
 from synflownet.data.replay_buffer import detach_and_cpu
 from synflownet.models import bengio2021flow
+from synflownet.envs.graph_building_env import Graph, GraphAction, GraphActionType
 from synflownet.algo.graph_sampling import Sampler
-
-from synflownet.tasks.n_model import GraphTransformerSynGFN
-
-DEVICE = "cuda"
-SEED = 0
-PRINT_EVERY = 1
-REWARD_THRESH = 0.9
 
 
 class ReactionTask:
 
-    def __init__(self):
+    def __init__(self, device):
         self.model = bengio2021flow.load_original_model()
-        self.model = self.model.to(DEVICE)
+        self.model = self.model.to(device)
         self.num_cond_dim = 32
+        self.device = device
 
     def cond_info_to_logreward(self, cond_info, flat_reward):
         return LogScalar(flat_reward.squeeze().clamp(min=1e-30).log() * cond_info["beta"])
@@ -40,7 +25,7 @@ class ReactionTask:
     def compute_obj_properties(self, mols):
         graphs = [bengio2021flow.mol2graph(m) for m in mols]
         batch = gd.Batch.from_data_list(graphs)
-        batch.to(DEVICE)
+        batch.to(self.device)
         preds = self.model(batch).reshape((-1,)).data.cpu() / 8
         preds[preds.isnan()] = 0
         preds = preds.clip(1e-4, 100).reshape((-1, 1))
@@ -103,7 +88,7 @@ class ReactionTemplateEnv:
                 return GraphAction(GraphActionType.BckReactBi, rxn=action.rxn, bb=1)
             else:
                 return GraphAction(GraphActionType.BckReactBi, rxn=action.rxn, bb=0)
-                
+
         elif action.action is GraphActionType.BckRemoveFirstReactant:
             return GraphAction(GraphActionType.AddFirstReactant)
         elif action.action is GraphActionType.BckReactUni:
@@ -114,16 +99,17 @@ class ReactionTemplateEnv:
 
 class SynthesisSampler(Sampler):
 
-    def __init__(self, ctx, env, max_len=None):
+    def __init__(self, ctx, env, device, max_len=None):
 
         self.ctx = ctx
         self.env = env
+        self.device = device
         self.max_len = max_len if max_len is not None else 5
 
-    def sample_from_model(self, model, n, cond_info, random_action_prob=0.0):
+    def sample_from_model(self, model, n, cond_info, random_action_prob=0):
 
         data = [
-            {"traj": [], "is_valid": True, "bck_a": [GraphAction(GraphActionType.Stop)], "is_sink": []}
+            {"traj": [], "is_valid": True, "bck_a": [GraphAction(GraphActionType.Stop)], "is_sink": [], "bck_logprobs": []}
             for _ in range(n)
         ]
 
@@ -134,9 +120,9 @@ class SynthesisSampler(Sampler):
 
             torch_graphs = [self.ctx.graph_to_Data(g, traj_len=t) for i, g in enumerate(graphs) if not done[i]]
             nx_graphs = [g for i, g in enumerate(graphs) if not done[i]]
-            not_done_mask = torch.tensor(done, device=DEVICE).logical_not()
+            not_done_mask = torch.tensor(done, device=self.device).logical_not()
 
-            fwd_cat, *_ = model(self.ctx.collate(torch_graphs).to(DEVICE), cond_info[not_done_mask])
+            fwd_cat, *_ = model(self.ctx.collate(torch_graphs).to(self.device), cond_info[not_done_mask])
             actions = fwd_cat.sample(nx_graphs=nx_graphs, model=model, random_action_prob=random_action_prob)
             graph_actions = [self.ctx.ActionIndex_to_GraphAction(g, a, fwd=True) for g, a in zip(torch_graphs, actions)]
 
@@ -146,25 +132,36 @@ class SynthesisSampler(Sampler):
 
                 if graph_actions[j].action is GraphActionType.Stop:
 
+                    data[i]["bck_a"].append(GraphAction(GraphActionType.Stop))
+                    data[i]["bck_logprobs"].append(torch.tensor([1.0], device=self.device).log())
                     data[i]["is_sink"].append(True)
                     done[i] = True
-                    data[i]["bck_a"].append(GraphAction(GraphActionType.Stop))
 
                 else:
 
+                    gp = self.env.step(graphs[i], graph_actions[j])
+
+                    data[i]["bck_a"].append(self.env.reverse(gp, graph_actions[j]))  # TODO: time and put behind if statement if too slow
+
+                    Chem.SanitizeMol(gp)
+                    g = self.ctx.obj_to_graph(gp)
+
+                    n_back = self.env.count_backward_transitions(g)  # TODO: time and put behind if statement if too slow
+                    data[i]["bck_logprobs"].append(torch.tensor([1 / n_back] if n_back > 0 else [0.001],
+                                                                device=self.device).log())
+
                     # in original implementation this is set to True for t = max_len-1
                     data[i]["is_sink"].append(False)
-
-                    gp = self.env.step(graphs[i], graph_actions[j])
-                    b_a = self.env.reverse(gp, graph_actions[j])
-                    data[i]["bck_a"].append(b_a)
+                    
+                    if graph_actions[j].action in [GraphActionType.AddFirstReactant,
+                                                   GraphActionType.ReactBi]:
+                        data[i]["bbs"].append(graph_actions[j].bb)
 
                     if t == self.max_len - 1:
                         done[i] = True
                         continue
 
-                    Chem.SanitizeMol(gp)
-                    graphs[i] = self.ctx.obj_to_graph(gp)
+                    graphs[i] = g
 
                 if done[i] and len(data[i]["traj"]) < 2:
                     data[i]["is_valid"] = False
@@ -178,19 +175,22 @@ class SynthesisSampler(Sampler):
 
             data[i]["traj"].append((graphs[i], GraphAction(GraphActionType.Stop)))
             data[i]["is_sink"].append(True)
+            data[i]["bck_logprobs"] = torch.stack(data[i]["bck_logprobs"]).reshape(-1)
 
         return data
 
 
-class TrajectoryBalance:
+class TrajectoryBalanceBase:
 
-    def __init__(self, ctx, sampler):
+    def __init__(self, ctx, sampler, device, preference_strength=0):
         self.ctx = ctx
         self.sampler = sampler
+        self.device = device
+        self.preference_strength = preference_strength
 
     def create_training_data_from_own_samples(self, model, n, cond_info, random_action_prob=0.0):
 
-        cond_info = cond_info.to(DEVICE)
+        cond_info = cond_info.to(self.device)
         data = self.sampler.sample_from_model(model, n, cond_info, random_action_prob)
         return data
 
@@ -214,58 +214,20 @@ class TrajectoryBalance:
         batch.cond_info_beta = torch.stack([t["cond_info"]["beta"] for t in trajs])
         batch.secondary_masks = self.ctx.precompute_secondary_masks(batch.actions, batch.nx_graphs)
         batch.log_p_B = torch.cat([i["bck_logprobs"] for i in trajs], 0)
+        batch.is_sink = torch.tensor(sum([i["is_sink"] for i in trajs], []))
         batch.log_bbs_cost = torch.log(torch.stack([t["bbs_cost"] for t in trajs]))
-
         batch.bck_actions = [
             self.ctx.GraphAction_to_ActionIndex(g, a, fwd=False)
             for g, a in zip(torch_graphs, [i for tj in trajs for i in tj["bck_a"]])
         ]
-        batch.is_sink = torch.tensor(sum([i["is_sink"] for i in trajs], []))
+
+        # TODO: consider better methods of combining the reward
+        batch.log_rewards -= batch.log_bbs_cost * self.preference_strength
 
         return batch
 
-    def compute_batch_losses(self, model, batch):
-
-        log_Z = model.logZ(batch.cond_info)[:, 0]
-        clipped_log_R = torch.maximum(batch.log_rewards, torch.tensor(-75, device=DEVICE)).float()
-
-        batch_idx = torch.arange(batch.traj_lens.shape[0], device=DEVICE).repeat_interleave(batch.traj_lens)
-        fwd_cat, bck_cat, _per_graph_out = model(batch, batch.cond_info[batch_idx])
-        for atype, (idcs, mask) in batch.secondary_masks.items():
-            fwd_cat.set_secondary_masks(atype, idcs, mask)
-
-        log_p_F = fwd_cat.log_prob(batch.actions, batch.nx_graphs, model)
-        log_p_B = bck_cat.log_prob(batch.bck_actions)
-
-        final_graph_idx = torch.cumsum(batch.traj_lens, 0) - 1
-
-        # don't count padding states on forward (kind of wasteful to compute these)
-        log_p_F[final_graph_idx] = 0
-
-        # don't count starting states or consecutive sinks (due to padding) on backward
-        log_p_B = torch.roll(log_p_B, -1, 0)
-        log_p_B[batch.is_sink] = 0
-
-        traj_log_p_F = scatter(log_p_F, batch_idx, dim=0, dim_size=batch.traj_lens.shape[0], reduce="sum")
-        traj_log_p_B = scatter(log_p_B, batch_idx, dim=0, dim_size=batch.traj_lens.shape[0], reduce="sum")
-
-        p_B_loss = 0  # TODOJ: apply REINFORCE for batch.log_bbs_cost (also test other algorithms / without log)
-
-        traj_log_p_B = traj_log_p_B.detach()
-
-        traj_diffs = (log_Z + traj_log_p_F) - (clipped_log_R + traj_log_p_B)
-        loss = (traj_diffs * traj_diffs).mean()
-
-        info = {
-            "log_z": log_Z.mean().item(),
-            "log_p_f": traj_log_p_F.mean().item(),
-            "log_p_b": traj_log_p_B.mean().item(),
-            "log_r": clipped_log_R.mean().item(),
-            "loss": loss.item()
-        }
-
-        return loss, info
-
+    def compute_batch_losses(self, _model, _batch):
+        raise NotImplementedError()
 
 class DataSource(IterableDataset):
     def __init__(self, ctx, algo, task):
@@ -311,37 +273,6 @@ class DataSource(IterableDataset):
 
         self.iterators.append(iterator)
 
-    def do_sample_model_n_times(self, model, num_samples_per_batch, num_total):
-
-        def iterator():
-            num_so_far = 0
-
-            while True:
-
-                n_this_time = min(num_total - num_so_far, num_samples_per_batch)
-
-                if n_this_time == 0:
-                    break
-
-                num_so_far += n_this_time
-
-                cond_info = {
-                    "beta": torch.tensor(np.array(32).repeat(n_this_time).astype(np.float32)),
-                    "encoding": torch.zeros((num_samples_per_batch, 32))
-                }
-
-                trajs = self.algo.create_training_data_from_own_samples(model, n_this_time, cond_info["encoding"], 0)
-
-                for i in range(len(trajs)):
-                    trajs[i]["cond_info"] = {k: cond_info[k][i] for k in cond_info}
-
-                self.compute_properties(trajs)
-                self.compute_log_rewards(trajs)
-
-                yield trajs[:n_this_time]
-
-        self.iterators.append(iterator)
-
     def compute_properties(self, trajs):
 
         valid_idcs = torch.tensor([i for i in range(len(trajs)) if trajs[i].get("is_valid", True)]).long()
@@ -364,110 +295,3 @@ class DataSource(IterableDataset):
 
         for i in range(len(trajs)):
             trajs[i]["log_reward"] = log_rewards[i] if trajs[i].get("is_valid", True) else min_r
-
-
-if __name__ == "__main__":
-
-    rel_path = "/".join(os.path.abspath(__file__).split("/")[:-2])
-
-    with open(rel_path + "/data/building_blocks/enamine_bbs.txt", "r") as file:
-        building_blocks = file.read().splitlines()
-
-    with open(rel_path + "/data/templates/hb.txt", "r") as file:
-        reaction_templates = file.read().splitlines()
-
-    with open(rel_path + "/data/building_blocks/precomputed_bb_masks_enamine_bbs.pkl", "rb") as f:
-        precomputed_bb_masks = pickle.load(f)
-
-    task = ReactionTask()  # for reward
-    ctx = ReactionTemplateEnvContext(  # deals with molecules
-        num_cond_dim=task.num_cond_dim,
-        building_blocks=building_blocks,
-        reaction_templates=reaction_templates,
-        precomputed_bb_masks=precomputed_bb_masks,
-        fp_type="morgan_1024",
-        fp_path=None,
-        strict_bck_masking=False
-    )
-    env = ReactionTemplateEnv(ctx)  # for actions
-    sampler = SynthesisSampler(ctx, env)  # for sampling policies
-    algo = TrajectoryBalance(ctx, sampler)  # for computing loss / helps making batches
-    model = GraphTransformerSynGFN(ctx, do_bck=True)
-
-    Z_params = list(model._logZ.parameters())
-    non_Z_params = [i for i in model.parameters() if all(id(i) != id(j) for j in Z_params)]
-
-    opt = torch.optim.Adam(non_Z_params, 1e-4, (0.9, 0.999), weight_decay=1e-8, eps=1e-8)
-    opt_Z = torch.optim.Adam(Z_params, 1e-3, (0.9, 0.999), weight_decay=1e-8, eps=1e-8)
-
-    lr_sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda steps: 2 ** -(steps/200))
-    lr_sched_Z = torch.optim.lr_scheduler.LambdaLR(opt_Z, lambda steps: 2 ** -(steps/5_000))
-
-    model.to(DEVICE)
-
-    with torch.no_grad():
-        train_src = DataSource(ctx, algo, task)  # gets training data inc rewards
-        train_src.do_sample_model(model, 64)
-        train_dl = torch.utils.data.DataLoader(train_src, batch_size=None)
-
-    unique_scaffolds = set()
-    num_unique_scaffolds = [0]
-    num_mols_tested = [0]
-
-    full_results = [[] for __ in range(6)]
-
-    start_time = time.time()
-
-    for it, batch in zip(range(1, 5001), cycle(train_dl)):
-
-        batch = batch.to(DEVICE)
-
-        model.train()
-
-        loss, info = algo.compute_batch_losses(model, batch)
-
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 10)
-
-        opt.step()
-        opt.zero_grad()
-        opt_Z.step()
-        opt_Z.zero_grad()
-
-        lr_sched.step()
-        lr_sched_Z.step()
-
-        # test number of unique high reward scaffolds we found *during training*
-        with torch.no_grad():
-
-            mols = [ctx.graph_to_obj(batch.nx_graphs[i]) for i in (torch.cumsum(batch.traj_lens, 0) - 1)]
-            rewards = torch.exp(batch.log_rewards / batch.cond_info_beta)
-
-            murcko_scaffolds = [MurckoScaffold.MurckoScaffoldSmiles(mol=m) for m in mols]
-
-            scaffolds_above_thresh = [smi for smi, r in zip(murcko_scaffolds, rewards) if r > REWARD_THRESH]
-            unique_scaffolds.update(scaffolds_above_thresh)
-
-            num_mols_tested.append(num_mols_tested[-1] + len(mols))
-            num_unique_scaffolds.append(len(unique_scaffolds))
-
-            np.save("unique_scaffolds.npy", list(zip(num_mols_tested, num_unique_scaffolds)))
-
-            total_time = time.time() - start_time
-            start_time = time.time()
-
-            if it % PRINT_EVERY == 0:
-                print(f"iteration {it} : loss:{info['loss']:7.3f} " \
-                    f"sampled_reward_avg:{rewards.mean().item():6.4f} " \
-                    f"time_spent:{total_time:4.2f} " \
-                    f"logZ:{info['log_z']:7.4f} " \
-                    f"gen scaffolds: {len(scaffolds_above_thresh)} " \
-                    f"unique scaffolds: {len(unique_scaffolds)}")
-
-            full_results[0].append(info["loss"])
-            full_results[1].append(rewards.mean().item())
-            full_results[2].append(total_time)
-            full_results[3].append(info["log_z"])
-            full_results[4].append(len(scaffolds_above_thresh))
-            full_results[5].append(len(unique_scaffolds))
-            np.save("full_results.npy", full_results)
