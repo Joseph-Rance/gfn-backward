@@ -16,7 +16,7 @@ class ReactionTaskConfig:
     reward: Optional[str] = None
     building_blocks_filename: str = "enamine_bbs.txt"
     precomputed_bb_masks_filename: str = "precomputed_bb_masks_enamine_bbs.pkl"
-    building_blocks_costs: Optional[str] = None
+    building_blocks_costs: Optional[str] = "enamine_bbs_costs.sdf"
     sanitize_building_blocks: bool = False
 
 

@@ -1,4 +1,5 @@
-"""Run with: python -m synflownet.tasks.maxent"""
+"""Run with: python -m synflownet.tasks.preference_reward"""
+# NOTE: algorithm implementation not here because will be merged with another file
 
 from itertools import cycle
 import pickle
@@ -14,7 +15,7 @@ from rdkit.Chem.Scaffolds import MurckoScaffold
 
 from synflownet import ObjectProperties, LogScalar
 from synflownet.envs.synthesis_building_env import ReactionTemplateEnvContext
-from synflownet.envs.graph_building_env import Graph, GraphAction, GraphActionType
+from synflownet.envs.graph_building_env import Graph, GraphActionType
 from synflownet.data.replay_buffer import detach_and_cpu
 from synflownet.models import bengio2021flow
 from synflownet.algo.graph_sampling import Sampler
@@ -25,6 +26,7 @@ DEVICE = "cuda"
 SEED = 0
 PRINT_EVERY = 1
 REWARD_THRESH = 0.9
+PREFERENCE_STRENGTH = 0.5
 
 
 class ReactionTask:
@@ -84,33 +86,6 @@ class ReactionTemplateEnv:
 
         return parents_count
 
-    def reverse(self, g, action):
-        if action.action is GraphActionType.AddFirstReactant:
-            return GraphAction(GraphActionType.BckRemoveFirstReactant)
-        elif action.action is GraphActionType.ReactUni:
-            return GraphAction(GraphActionType.BckReactUni, rxn=action.rxn)
-        elif action.action is GraphActionType.ReactBi:
-
-            bck_a = GraphAction(GraphActionType.BckReactBi, rxn=action.rxn, bb=0)
-
-            mol = self.ctx.get_mol(g)
-            reaction = self.ctx.bimolecular_reactions[bck_a.rxn]
-            products = reaction.run_reverse_reactants((mol,))
-            products_smi = [Chem.MolToSmiles(p) for p in products]
-
-            all_bbs = self.ctx.building_blocks
-            if (products_smi[0] in all_bbs) and (products_smi[1] in all_bbs):
-                return GraphAction(GraphActionType.BckReactBi, rxn=action.rxn, bb=1)
-            else:
-                return GraphAction(GraphActionType.BckReactBi, rxn=action.rxn, bb=0)
-                
-        elif action.action is GraphActionType.BckRemoveFirstReactant:
-            return GraphAction(GraphActionType.AddFirstReactant)
-        elif action.action is GraphActionType.BckReactUni:
-            return GraphAction(GraphActionType.ReactUni, rxn=action.rxn)
-        elif action.action is GraphActionType.BckReactBi:
-            return GraphAction(GraphActionType.ReactBi, rxn=action.rxn, bb=action.bb)
-
 
 class SynthesisSampler(Sampler):
 
@@ -123,9 +98,11 @@ class SynthesisSampler(Sampler):
     def sample_from_model(self, model, n, cond_info, random_action_prob=0.0):
 
         data = [
-            {"traj": [], "is_valid": True, "bck_a": [GraphAction(GraphActionType.Stop)], "is_sink": []}
+            {"traj": [], "is_valid": True, "bbs": []}
             for _ in range(n)
         ]
+
+        bck_logprob = [[] for _ in range(n)]
 
         graphs = [self.env.empty_graph() for _ in range(n)]
         done = [False] * n
@@ -146,24 +123,38 @@ class SynthesisSampler(Sampler):
 
                 if graph_actions[j].action is GraphActionType.Stop:
 
-                    data[i]["is_sink"].append(True)
                     done[i] = True
-                    data[i]["bck_a"].append(GraphAction(GraphActionType.Stop))
+                    bck_logprob[i].append(torch.tensor([1.0], device=DEVICE).log())
 
                 else:
-
-                    data[i]["is_sink"].append(False)
+                    
+                    if graph_actions[j].action in [GraphActionType.AddFirstReactant,
+                                                   GraphActionType.ReactBi]:
+                        data[i]["bbs"].append(graph_actions[j].bb)
 
                     gp = self.env.step(graphs[i], graph_actions[j])
-                    b_a = self.env.reverse(gp, graph_actions[j])
-                    data[i]["bck_a"].append(b_a)
+
+                    try:
+                        Chem.SanitizeMol(gp)
+                    except Exception as e:
+                        data[i]["is_valid"] = False
+                        done[i] = True
+                        bck_logprob[i].append(torch.tensor([1.0], device=DEVICE).log())
+                        continue
+
+                    g = self.ctx.obj_to_graph(gp)
+
+                    n_back = self.env.count_backward_transitions(g)
+                    if n_back > 0:
+                        bck_logprob[i].append(torch.tensor([1 / n_back], device=DEVICE).log())
+                    else:
+                        bck_logprob[i].append(torch.tensor([0.001], device=DEVICE).log())
 
                     if t == self.max_len - 1:
                         done[i] = True
                         continue
 
-                    Chem.SanitizeMol(gp)
-                    graphs[i] = self.ctx.obj_to_graph(gp)
+                    graphs[i] = g
 
                 if done[i] and len(data[i]["traj"]) < 2:
                     data[i]["is_valid"] = False
@@ -172,11 +163,9 @@ class SynthesisSampler(Sampler):
                 break
 
         for i in range(n):
-
             data[i]["result"] = graphs[i]
-
-            data[i]["traj"].append((graphs[i], GraphAction(GraphActionType.Stop)))
-            data[i]["is_sink"].append(True)
+            if bck_logprob[i]:
+                data[i]["bck_logprobs"] = torch.stack(bck_logprob[i]).reshape(-1)
 
         return data
 
@@ -213,52 +202,34 @@ class TrajectoryBalance:
         batch.cond_info_beta = torch.stack([t["cond_info"]["beta"] for t in trajs])
         batch.secondary_masks = self.ctx.precompute_secondary_masks(batch.actions, batch.nx_graphs)
         batch.log_p_B = torch.cat([i["bck_logprobs"] for i in trajs], 0)
+        batch.log_bbs_cost = torch.log(torch.stack([t["bbs_cost"] for t in trajs]))
 
-        batch.bck_actions = [
-            self.ctx.GraphAction_to_ActionIndex(g, a, fwd=False)
-            for g, a in zip(torch_graphs, [i for tj in trajs for i in tj["bck_a"]])
-        ]
-        batch.is_sink = torch.tensor(sum([i["is_sink"] for i in trajs], []))
+        #batch.log_rewards -= torch.max(batch.log_rewards)
+        #batch.bbs_cost -= torch.max(batch.bbs_cost) - torch.log(PREFERENCE_STRENGTH)
+
+        # TODOJ: consider better methods of combining the reward
+        batch.log_rewards -= batch.log_bbs_cost * PREFERENCE_STRENGTH
 
         return batch
-
-    def huber(_self, x, beta=1, i_delta=4):
-        ax = torch.abs(x)
-        return torch.where(ax <= beta, 0.5 * x * x, beta * (ax - beta / 2)) * i_delta
 
     def compute_batch_losses(self, model, batch):
 
         log_Z = model.logZ(batch.cond_info)[:, 0]
         clipped_log_R = torch.maximum(batch.log_rewards, torch.tensor(-75, device=DEVICE)).float()
 
-        final_graph_idxs = torch.cumsum(batch.traj_lens, 0)
-        first_graph_idxs = torch.roll(final_graph_idxs, 1, dims=0)
-        first_graph_idxs[0] = 0
-
         batch_idx = torch.arange(batch.traj_lens.shape[0], device=DEVICE).repeat_interleave(batch.traj_lens)
-
-        fwd_cat, bck_cat, per_graph_out = model(batch, batch.cond_info[batch_idx])
-
+        fwd_cat, per_graph_out = model(batch, batch.cond_info[batch_idx])
         for atype, (idcs, mask) in batch.secondary_masks.items():
             fwd_cat.set_secondary_masks(atype, idcs, mask)
 
-        log_p_F = fwd_cat.log_prob(batch.actions, batch.nx_graphs, model)
-        log_p_B = bck_cat.log_prob(batch.bck_actions)
 
-        # don't count padding states on forward (kind of wasteful to compute these)
-        log_p_F[final_graph_idxs - 1] = 0
-
-        # don't count starting states or consecutive sinks (due to padding) on backward
-        log_p_B = torch.roll(log_p_B, -1, 0)
-        log_p_B[batch.is_sink] = 0
-
-        traj_log_p_F = scatter(log_p_F, batch_idx, dim=0, dim_size=batch.traj_lens.shape[0], reduce="sum")
-        traj_log_p_B = scatter(log_p_B, batch_idx, dim=0, dim_size=batch.traj_lens.shape[0], reduce="sum")
-
+        final_graph_idxs = torch.cumsum(batch.traj_lens, 0)
+        first_graph_idxs = torch.roll(final_graph_idxs, 1, dims=0)
+        first_graph_idxs[0] = 0
         log_n_preds = per_graph_out[:, 1]  # 0 is for reward pred (unused)
-        log_n_preds[first_graph_idxs] = 0
 
-        # we want to minimise (for all i):
+
+        # to want to minimise (for all i):
         #     l(s_i) - l(s_{i+d}) - sum_{t=i}^{i+d-1}[ log(q(s_t|s_{t+1})) ]
         # where l and log.q are learnt and we let l(s_0) = 0. This allows us to learn
         #      l(s_0) = 0
@@ -277,16 +248,21 @@ class TrajectoryBalance:
         # so if we learn an accurate q, it makes sense that we will find an accurate l. The reverse
         # also trivially holds, since we want q(s|s') = n(s)/n(s')
         # note: q(.|s) MUST be normalised, otherwise we can just learn l(.)=0 and q(.|.)=1
-        # we let d = 1. Then, since l(s_0) = 0, the loss function becomes:
-        #     l(s_F) + sum[ log(q(s_t|s_{t+1})) ]
-        # where the sum is over the full trajectory and s_F is the last state
 
-        traj_pred_l = log_n_preds[torch.maximum(final_graph_idxs - 2, first_graph_idxs)]  # kind of wasteful
-        n_loss = self.huber(traj_log_p_B + traj_pred_l).mean()
-        traj_log_p_B = traj_log_p_B.detach()
+        neg_log_traj_n = scatter(
+            batch.log_p_B, batch_idx, dim=0, dim_size=batch.traj_lens.shape[0], reduce="sum"
+        )
+        n_diff = neg_log_traj_n + log_n_preds[torch.maximum(final_graph_idxs - 2, first_graph_idxs)]
+        n_loss = (n_diff * n_diff).mean()
+
+        log_p_F = fwd_cat.log_prob(batch.actions, batch.nx_graphs, model)
+        traj_log_p_F = scatter(log_p_F, batch_idx, dim=0, dim_size=batch.traj_lens.shape[0], reduce="sum")
+
+        traj_log_p_B = log_n_preds[torch.maximum(final_graph_idxs - 2, first_graph_idxs)]
+        traj_log_p_B.detach()
 
         traj_diffs = (log_Z + traj_log_p_F) - (clipped_log_R + traj_log_p_B)
-        tb_loss = self.huber(traj_diffs).mean()
+        tb_loss = (traj_diffs * traj_diffs).mean()
 
         loss = tb_loss + n_loss
 
@@ -369,6 +345,7 @@ class DataSource(IterableDataset):
 
                 for i in range(len(trajs)):
                     trajs[i]["cond_info"] = {k: cond_info[k][i] for k in cond_info}
+                    trajs[i]["bbs_cost"] = sum(self.ctx.bbs_costs[bb] for bb in trajs[i]["bbs"])
 
                 self.compute_properties(trajs)
                 self.compute_log_rewards(trajs)
@@ -427,7 +404,7 @@ if __name__ == "__main__":
     env = ReactionTemplateEnv(ctx)  # for actions
     sampler = SynthesisSampler(ctx, env)  # for sampling policies
     algo = TrajectoryBalance(ctx, sampler)  # for computing loss / helps making batches
-    model = GraphTransformerSynGFN(ctx, do_bck=True, outs=2)
+    model = GraphTransformerSynGFN(ctx, outs=2)
 
     Z_params = list(model._logZ.parameters())
     non_Z_params = [i for i in model.parameters() if all(id(i) != id(j) for j in Z_params)]
@@ -435,8 +412,8 @@ if __name__ == "__main__":
     opt = torch.optim.Adam(non_Z_params, 1e-4, (0.9, 0.999), weight_decay=1e-8, eps=1e-8)
     opt_Z = torch.optim.Adam(Z_params, 1e-3, (0.9, 0.999), weight_decay=1e-8, eps=1e-8)
 
-    lr_sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda steps: 2 ** -(steps/200))
-    lr_sched_Z = torch.optim.lr_scheduler.LambdaLR(opt_Z, lambda steps: 2 ** -(steps/5_000))
+    lr_sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda steps: 2 ** -(steps/2_000))
+    lr_sched_Z = torch.optim.lr_scheduler.LambdaLR(opt_Z, lambda steps: 2 ** -(steps/50_000))
 
     model.to(DEVICE)
 

@@ -158,7 +158,7 @@ class SynthesisSampler(Sampler):
 
         for i in range(n):
             data[i]["result"] = graphs[i]
-            if len(bck_logprob[i]):
+            if bck_logprob[i]:
                 data[i]["bck_logprobs"] = torch.stack(bck_logprob[i]).reshape(-1)
 
         return data
@@ -361,7 +361,6 @@ if __name__ == "__main__":
     opt = torch.optim.Adam(non_Z_params, 1e-4, (0.9, 0.999), weight_decay=1e-8, eps=1e-8)
     opt_Z = torch.optim.Adam(Z_params, 1e-3, (0.9, 0.999), weight_decay=1e-8, eps=1e-8)
 
-    # TODOJ: changed from SFN defaults - 2_000, 50_000
     lr_sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda steps: 2 ** -(steps/200))
     lr_sched_Z = torch.optim.lr_scheduler.LambdaLR(opt_Z, lambda steps: 2 ** -(steps/5_000))
 
@@ -387,7 +386,7 @@ if __name__ == "__main__":
     for it, batch in zip(range(1, 5001), cycle(train_dl)):
 
         batch = batch.to(DEVICE)
-        
+
         model.train()
 
         loss, info = algo.compute_batch_losses(model, batch)
@@ -437,8 +436,6 @@ if __name__ == "__main__":
             full_results[4].append(len(scaffolds_above_thresh))
             full_results[5].append(len(unique_scaffolds))
             np.save("full_results.npy", full_results)
-
-            # TODOJ: log checkpoints + molecules to wandb (on all setups) before running on HPC!
 
     # TODOJ: does this fix memory leak?
     del batch

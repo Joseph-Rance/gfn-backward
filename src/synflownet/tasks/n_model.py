@@ -1,3 +1,4 @@
+from itertools import chain
 import torch
 import torch.nn as nn
 
@@ -13,7 +14,7 @@ DEVICE = "cuda"
 
 class GraphTransformerSynGFN(nn.Module):
 
-    def __init__(self, env_ctx, outs=1):
+    def __init__(self, env_ctx, do_bck=False, outs=1):
         super().__init__()
 
         num_emb = 128
@@ -77,19 +78,24 @@ class GraphTransformerSynGFN(nn.Module):
         }
 
         mlps = {}
-        for atype in env_ctx.action_type_order:
+        atypes = chain(env_ctx.action_type_order, env_ctx.bck_action_type_order) if do_bck \
+            else env_ctx.action_type_order
+        for atype in atypes:
             num_in, num_out = self._action_type_to_num_inputs_outputs[atype]
             mlps[atype.cname] = mlp(num_in, num_emb, num_out, 0)
         self.mlps = nn.ModuleDict(mlps)
 
+        self.do_bck = do_bck
+
         self.action_type_order = env_ctx.action_type_order
+        self.bck_action_type_order = env_ctx.bck_action_type_order
 
         self.emb2graph_out = mlp(num_emb*2, num_emb, outs, 0)
         self._logZ = mlp(max(1, env_ctx.num_cond_dim), num_emb*2, 1, 2)
 
         self._ae = [env_ctx.building_blocks_embs.to(DEVICE)]
 
-    def _make_cat(self, g, emb, action_types):
+    def _make_cat(self, g, emb, action_types, fwd=False):
 
         raw_logits = []
         for t in action_types:
@@ -107,7 +113,7 @@ class GraphTransformerSynGFN(nn.Module):
             keys=[self._action_type_to_key[t] for t in action_types if self._action_type_to_key[t] is not None],
             action_masks=[action_type_to_mask(t, g) for t in action_types],
             types=action_types,
-            fwd=True,
+            fwd=fwd,
         )
 
     def forward(self, g, cond):
@@ -131,8 +137,15 @@ class GraphTransformerSynGFN(nn.Module):
         }
 
         graph_out = self.emb2graph_out(graph_embeddings)
+
         action_type_order = [x for x in self.action_type_order if x != GraphActionType.AddReactant]
+        bck_action_type_order = self.bck_action_type_order
+
         fwd_cat = self._make_cat(g, emb, action_type_order)
+
+        if self.do_bck:
+            bck_cat = self._make_cat(g, emb, bck_action_type_order, fwd=False)
+            return fwd_cat, bck_cat, graph_out
 
         return fwd_cat, graph_out
 

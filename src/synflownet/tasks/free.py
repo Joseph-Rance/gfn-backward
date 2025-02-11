@@ -1,4 +1,4 @@
-"""Run with: python -m synflownet.tasks.maxent"""
+"""Run with: python -m synflownet.tasks.free"""
 
 from itertools import cycle
 import pickle
@@ -152,6 +152,7 @@ class SynthesisSampler(Sampler):
 
                 else:
 
+                    # in original implementation this is set to True for t = max_len-1
                     data[i]["is_sink"].append(False)
 
                     gp = self.env.step(graphs[i], graph_actions[j])
@@ -222,31 +223,23 @@ class TrajectoryBalance:
 
         return batch
 
-    def huber(_self, x, beta=1, i_delta=4):
-        ax = torch.abs(x)
-        return torch.where(ax <= beta, 0.5 * x * x, beta * (ax - beta / 2)) * i_delta
-
     def compute_batch_losses(self, model, batch):
 
         log_Z = model.logZ(batch.cond_info)[:, 0]
         clipped_log_R = torch.maximum(batch.log_rewards, torch.tensor(-75, device=DEVICE)).float()
 
-        final_graph_idxs = torch.cumsum(batch.traj_lens, 0)
-        first_graph_idxs = torch.roll(final_graph_idxs, 1, dims=0)
-        first_graph_idxs[0] = 0
-
         batch_idx = torch.arange(batch.traj_lens.shape[0], device=DEVICE).repeat_interleave(batch.traj_lens)
-
-        fwd_cat, bck_cat, per_graph_out = model(batch, batch.cond_info[batch_idx])
-
+        fwd_cat, bck_cat, _per_graph_out = model(batch, batch.cond_info[batch_idx])
         for atype, (idcs, mask) in batch.secondary_masks.items():
             fwd_cat.set_secondary_masks(atype, idcs, mask)
 
         log_p_F = fwd_cat.log_prob(batch.actions, batch.nx_graphs, model)
         log_p_B = bck_cat.log_prob(batch.bck_actions)
 
+        final_graph_idx = torch.cumsum(batch.traj_lens, 0) - 1
+
         # don't count padding states on forward (kind of wasteful to compute these)
-        log_p_F[final_graph_idxs - 1] = 0
+        log_p_F[final_graph_idx] = 0
 
         # don't count starting states or consecutive sinks (due to padding) on backward
         log_p_B = torch.roll(log_p_B, -1, 0)
@@ -255,48 +248,14 @@ class TrajectoryBalance:
         traj_log_p_F = scatter(log_p_F, batch_idx, dim=0, dim_size=batch.traj_lens.shape[0], reduce="sum")
         traj_log_p_B = scatter(log_p_B, batch_idx, dim=0, dim_size=batch.traj_lens.shape[0], reduce="sum")
 
-        log_n_preds = per_graph_out[:, 1]  # 0 is for reward pred (unused)
-        log_n_preds[first_graph_idxs] = 0
-
-        # we want to minimise (for all i):
-        #     l(s_i) - l(s_{i+d}) - sum_{t=i}^{i+d-1}[ log(q(s_t|s_{t+1})) ]
-        # where l and log.q are learnt and we let l(s_0) = 0. This allows us to learn
-        #      l(s_0) = 0
-        #       l(s') = log(sum_{s in parents(s')}[ exp(l(s)) ])
-        #     log(q(s|s')) = l(s) - l(s')
-        # For a non-rigorous, intuitive explanation, consider the case where d=1. Then we are trying
-        # to minimise:
-        #     l(s_i) - l(s_{i+1}) - log(q(s_i|s_{i+1}))
-        # so we will find something that looks like
-        #     l(s_{i+1}) = l(s_i) - log(q(s_i|s_{i+1}))
-        # apply exp:
-        #     exp(l(s_{i+1})) = exp(l(s_i))/q(s_i|s_{i+1})
-        # And now consider the expected value over s_i of the RHS:
-        #     E[ exp(l(s_i))/q(s_i|s_{i+1}) ]
-        #     = sum_{s in parents(s_{i+1})}[ exp(l(s)) ]
-        # so if we learn an accurate q, it makes sense that we will find an accurate l. The reverse
-        # also trivially holds, since we want q(s|s') = n(s)/n(s')
-        # note: q(.|s) MUST be normalised, otherwise we can just learn l(.)=0 and q(.|.)=1
-        # we let d = 1. Then, since l(s_0) = 0, the loss function becomes:
-        #     l(s_F) + sum[ log(q(s_t|s_{t+1})) ]
-        # where the sum is over the full trajectory and s_F is the last state
-
-        traj_pred_l = log_n_preds[torch.maximum(final_graph_idxs - 2, first_graph_idxs)]  # kind of wasteful
-        n_loss = self.huber(traj_log_p_B + traj_pred_l).mean()
-        traj_log_p_B = traj_log_p_B.detach()
-
         traj_diffs = (log_Z + traj_log_p_F) - (clipped_log_R + traj_log_p_B)
-        tb_loss = self.huber(traj_diffs).mean()
-
-        loss = tb_loss + n_loss
+        loss = (traj_diffs * traj_diffs).mean()
 
         info = {
             "log_z": log_Z.mean().item(),
             "log_p_f": traj_log_p_F.mean().item(),
             "log_p_b": traj_log_p_B.mean().item(),
             "log_r": clipped_log_R.mean().item(),
-            "tb_loss": tb_loss.item(),
-            "n_loss": n_loss.item(),
             "loss": loss.item()
         }
 
@@ -322,7 +281,7 @@ class DataSource(IterableDataset):
             if any(i is None for i in iterator_outputs):
                 break
 
-            return self.algo.construct_batch(detach_and_cpu(sum(iterator_outputs, [])))
+            yield self.algo.construct_batch(detach_and_cpu(sum(iterator_outputs, [])))
 
     def do_sample_model(self, model, num_samples):
 
@@ -427,7 +386,7 @@ if __name__ == "__main__":
     env = ReactionTemplateEnv(ctx)  # for actions
     sampler = SynthesisSampler(ctx, env)  # for sampling policies
     algo = TrajectoryBalance(ctx, sampler)  # for computing loss / helps making batches
-    model = GraphTransformerSynGFN(ctx, do_bck=True, outs=2)
+    model = GraphTransformerSynGFN(ctx, do_bck=True)
 
     Z_params = list(model._logZ.parameters())
     non_Z_params = [i for i in model.parameters() if all(id(i) != id(j) for j in Z_params)]
@@ -456,7 +415,7 @@ if __name__ == "__main__":
     for it, batch in zip(range(1, 5001), cycle(train_dl)):
 
         batch = batch.to(DEVICE)
-        
+
         model.train()
 
         loss, info = algo.compute_batch_losses(model, batch)
