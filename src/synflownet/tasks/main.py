@@ -16,8 +16,8 @@ from synflownet.tasks.util import ReactionTask, ReactionTemplateEnv, SynthesisSa
 DEVICE = "cuda"
 PRINT_EVERY = 1
 REWARD_THRESH = 0.9
-PREFERENCE_STRENGTH = 0
-ALGO = TrajectoryBalanceUniform
+PREFERENCE_STRENGTH = 0  # TODO: test with >0
+ALGO = TrajectoryBalanceUniform  # TODO: test the other algorithms
 PARAMETERISE_P_B = False
 OUTS = 1  # 2 for MaxEnt
 
@@ -112,6 +112,8 @@ if __name__ == "__main__":
             total_time = time.time() - start_time
             start_time = time.time()
 
+            # TODON: log/save trajectory bb costs
+
             if it % PRINT_EVERY == 0:
                 print(f"iteration {it} : loss:{info['loss']:7.3f} " \
                     f"sampled_reward_avg:{rewards.mean().item():6.4f} " \
@@ -128,7 +130,7 @@ if __name__ == "__main__":
             full_results[5].append(len(unique_scaffolds))
             np.save("full_results.npy", full_results)
 
-            # TODO: save checkpoints + molecules to wandb
+            # TODON: save checkpoints + molecules to wandb
 
     # TODO: does this fix memory leak?
     del batch

@@ -3,7 +3,16 @@ from torch_scatter import scatter
 
 from synflownet.tasks.util import TrajectoryBalanceBase
 
+
+# TODON:
+#  - currently train p_B both trajs and p_F on only forward traj as in original code
+#  - i previously assumed that p_F can be trained on both
+#    but p_B needs to be changed slightly before it can be (i.e. remove log, ...)
+#  - also don't understand algorithm 3 in the SFN paper
+
 class TrajectoryBalancePref(TrajectoryBalanceBase):
+
+    entropy_loss_multiplier = 1
 
     def compute_batch_losses(self, model, batch):
 
@@ -30,18 +39,24 @@ class TrajectoryBalancePref(TrajectoryBalanceBase):
         traj_log_p_F = scatter(log_p_F, batch_idx, dim=0, dim_size=batch.traj_lens.shape[0], reduce="sum")
         traj_log_p_B = scatter(log_p_B, batch_idx, dim=0, dim_size=batch.traj_lens.shape[0], reduce="sum")
 
-        p_B_loss = 0  # TODO: apply REINFORCE for batch.log_bbs_cost (also test other algorithms / without log)
+        p_B_loss = - (traj_log_p_B * batch.bck_rewards).mean() - self.entropy_loss_multiplier * bck_cat.entropy().mean()
 
         traj_log_p_B = traj_log_p_B.detach()
 
-        traj_diffs = (log_Z + traj_log_p_F) - (clipped_log_R + traj_log_p_B)
-        loss = (traj_diffs * traj_diffs).mean()
+        traj_diffs = (log_Z[not batch.from_p_b] + traj_log_p_F[not batch.from_p_b]) \
+                   - (clipped_log_R[not batch.from_p_b] + traj_log_p_B[not batch.from_p_b])  # TODON: need to implement backward sampling
+        tb_loss = (traj_diffs * traj_diffs).mean()  # train p_F with p_B from prev. iteration
+                                                    # (slightly different from algorithm 1 in the paper)
+
+        loss = tb_loss + p_B_loss
 
         info = {
             "log_z": log_Z.mean().item(),
             "log_p_f": traj_log_p_F.mean().item(),
             "log_p_b": traj_log_p_B.mean().item(),
             "log_r": clipped_log_R.mean().item(),
+            "tb_loss": tb_loss.item(),
+            "p_b_loss": p_B_loss.item(),
             "loss": loss.item()
         }
 
@@ -111,17 +126,17 @@ class TrajectoryBalanceTLM(TrajectoryBalanceBase):
         traj_log_p_B = traj_log_p_B.detach()
 
         traj_diffs = (log_Z + traj_log_p_F) - (clipped_log_R + traj_log_p_B)
-        td_loss = (traj_diffs * traj_diffs).mean()  # train p_F with p_B from prev. iteration
+        tb_loss = (traj_diffs * traj_diffs).mean()  # train p_F with p_B from prev. iteration
                                                     # (slightly different from algorithm 1 in the paper)
 
-        loss = td_loss + back_loss
+        loss = tb_loss + back_loss
 
         info = {
             "log_z": log_Z.mean().item(),
             "log_p_f": traj_log_p_F.mean().item(),
             "log_p_b": traj_log_p_B.mean().item(),
             "log_r": clipped_log_R.mean().item(),
-            "td_loss": td_loss.item(),
+            "tb_loss": tb_loss.item(),
             "back_loss": back_loss.item(),
             "loss": loss.item()
         }

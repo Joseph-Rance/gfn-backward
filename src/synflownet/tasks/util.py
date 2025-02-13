@@ -221,7 +221,7 @@ class TrajectoryBalanceBase:
             for g, a in zip(torch_graphs, [i for tj in trajs for i in tj["bck_a"]])
         ]
 
-        # TODO: consider better methods of combining the reward
+        # TODO: try better methods of combining the reward
         batch.log_rewards -= batch.log_bbs_cost * self.preference_strength
 
         return batch
