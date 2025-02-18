@@ -1,11 +1,11 @@
 __pycache__/
 
-src/synflownet/data/building_blocks/enamine_bbs_costs.sdf
-src/synflownet/data/building_blocks/enamine_bbs.txt
-src/synflownet/data/building_blocks/enamine_bbs_subsampled_5000.txt
-src/synflownet/data/building_blocks/short_building_blocks.txt
-src/synflownet/data/building_blocks/sanitised_bbs.txt
-src/synflownet/data/building_blocks/short_building_blocks_subsampled_10000.txt
-src/synflownet/data/building_blocks/unique_bbs.txt
-src/synflownet/data/building_blocks/precomputed_bb_masks_enamine_bbs.pkl
-src/synflownet/data/building_blocks/bbs.txt
+src/back_gfn/data/building_blocks/enamine_bbs_costs.sdf
+src/back_gfn/data/building_blocks/enamine_bbs.txt
+src/back_gfn/data/building_blocks/enamine_bbs_subsampled_5000.txt
+src/back_gfn/data/building_blocks/short_building_blocks.txt
+src/back_gfn/data/building_blocks/sanitised_bbs.txt
+src/back_gfn/data/building_blocks/short_building_blocks_subsampled_10000.txt
+src/back_gfn/data/building_blocks/unique_bbs.txt
+src/back_gfn/data/building_blocks/precomputed_bb_masks_enamine_bbs.pkl
+src/back_gfn/data/building_blocks/bbs.txt

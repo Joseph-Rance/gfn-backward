@@ -1,30 +1,26 @@
 import torch
 from torch_scatter import scatter
 
-from synflownet.tasks.util import TrajectoryBalanceBase
+from back_gfn.tasks.util import TrajectoryBalanceBase
 
 
-# TODON:
-#  - currently train p_B both trajs and p_F on only forward traj as in original code
-#  - i previously assumed that p_F can be trained on both
-#    but p_B needs to be changed slightly before it can be (i.e. remove log, ...)
-#  - also don't understand algorithm 3 in the SFN paper
+ENTROPY_LOSS_MULTIPLIER = 1  # TODO: optimise
+
 
 class TrajectoryBalancePref(TrajectoryBalanceBase):
 
-    entropy_loss_multiplier = 1
-
     def compute_batch_losses(self, model, batch):
 
-        log_Z = model.logZ(batch.cond_info)[:, 0]
-        clipped_log_R = torch.maximum(batch.log_rewards, torch.tensor(-75, device=self.device)).float()
+        forward_log_Z = model.logZ(batch.cond_info[not batch.from_p_b])[:, 0]
+        forward_clipped_log_R = torch.maximum(batch.log_rewards[not batch.from_p_b], torch.tensor(-75, device=self.device)).float()
 
         batch_idx = torch.arange(batch.traj_lens.shape[0], device=self.device).repeat_interleave(batch.traj_lens)
         fwd_cat, bck_cat, _per_graph_out = model(batch, batch.cond_info[batch_idx])
         for atype, (idcs, mask) in batch.secondary_masks.items():
             fwd_cat.set_secondary_masks(atype, idcs, mask)
 
-        log_p_F = fwd_cat.log_prob(batch.actions, batch.nx_graphs, model)
+        p_b_mask = batch.from_p_b.to(self.device).repeat_interleave(batch.traj_lens)
+        log_p_F = fwd_cat.log_prob(batch.actions, batch.nx_graphs, model)[not p_b_mask]
         log_p_B = bck_cat.log_prob(batch.bck_actions)
 
         final_graph_idx = torch.cumsum(batch.traj_lens, 0) - 1
@@ -39,22 +35,22 @@ class TrajectoryBalancePref(TrajectoryBalanceBase):
         traj_log_p_F = scatter(log_p_F, batch_idx, dim=0, dim_size=batch.traj_lens.shape[0], reduce="sum")
         traj_log_p_B = scatter(log_p_B, batch_idx, dim=0, dim_size=batch.traj_lens.shape[0], reduce="sum")
 
-        p_B_loss = - (traj_log_p_B * batch.bck_rewards).mean() - self.entropy_loss_multiplier * bck_cat.entropy().mean()
+        p_B_loss = - (traj_log_p_B[batch.from_p_b] * batch.bck_rewards[batch.from_p_b]).mean() \
+                   + ENTROPY_LOSS_MULTIPLIER * sum([(i * i.exp()).sum(1) for i in log_p_B[p_b_mask]])
 
         traj_log_p_B = traj_log_p_B.detach()
 
-        traj_diffs = (log_Z[not batch.from_p_b] + traj_log_p_F[not batch.from_p_b]) \
-                   - (clipped_log_R[not batch.from_p_b] + traj_log_p_B[not batch.from_p_b])  # TODON: need to implement backward sampling
+        traj_diffs = (forward_log_Z + traj_log_p_F[not batch.from_p_b]) - (forward_clipped_log_R + traj_log_p_B[not batch.from_p_b])
         tb_loss = (traj_diffs * traj_diffs).mean()  # train p_F with p_B from prev. iteration
                                                     # (slightly different from algorithm 1 in the paper)
 
         loss = tb_loss + p_B_loss
 
         info = {
-            "log_z": log_Z.mean().item(),
-            "log_p_f": traj_log_p_F.mean().item(),
-            "log_p_b": traj_log_p_B.mean().item(),
-            "log_r": clipped_log_R.mean().item(),
+            "log_z": forward_log_Z.mean().item(),
+            "log_p_f": traj_log_p_F[not batch.from_p_b].mean().item(),
+            "log_p_b": traj_log_p_B[not batch.from_p_b].mean().item(),
+            "log_r": forward_clipped_log_R.mean().item(),
             "tb_loss": tb_loss.item(),
             "p_b_loss": p_B_loss.item(),
             "loss": loss.item()

@@ -1,7 +1,9 @@
+import random
 import numpy as np
 import torch
 from torch.utils.data import IterableDataset
 import torch_geometric.data as gd
+import rdkit
 from rdkit import Chem
 
 from synflownet import ObjectProperties, LogScalar
@@ -9,6 +11,9 @@ from synflownet.data.replay_buffer import detach_and_cpu
 from synflownet.models import bengio2021flow
 from synflownet.envs.graph_building_env import Graph, GraphAction, GraphActionType
 from synflownet.algo.graph_sampling import Sampler
+
+
+REPLAY_BUFFER_LEN = 10_000
 
 
 class ReactionTask:
@@ -58,6 +63,62 @@ class ReactionTemplateEnv:
             reaction = self.ctx.bimolecular_reactions[action.rxn]
             reactant2 = self.ctx.get_mol(self.ctx.building_blocks[action.bb])
             return reaction.run_reactants((mol, reactant2))
+
+    def backward_step(self, smi, action):
+
+        mol = self.ctx.get_mol(smi)
+
+        if action.action is GraphActionType.BckRemoveFirstReactant:
+            return self.ctx.get_mol(""), None, None
+
+        elif action.action is GraphActionType.BckReactUni:
+            reaction = self.ctx.unimolecular_reactions[action.rxn]
+            return reaction.run_reverse_reactants((mol,)), None, None
+
+        else:
+
+            reaction = self.ctx.bimolecular_reactions[action.rxn]
+            products = reaction.run_reverse_reactants((mol,))
+            products_smi = [Chem.MolToSmiles(p) for p in products]
+
+            all_bbs = self.ctx.building_blocks
+
+            if (products_smi[0] in all_bbs) and (products_smi[1] in all_bbs):
+                both_are_bb = 1
+                selection = random.choice((0, 1))
+                selected_product = products[selection]
+                other_product = products_smi[1-selection]
+
+            elif products_smi[0] in all_bbs:
+                both_are_bb = 0
+                selected_product = products[1]
+                other_product = products_smi[0]
+
+            elif products_smi[1] in all_bbs:
+                both_are_bb = 0
+                selected_product = products[0]
+                other_product = products_smi[1]
+
+            else:
+                raise ValueError()
+
+            other_product = self.ctx.building_blocks.index(other_product)
+
+            rw_mol = Chem.RWMol(selected_product)
+            Chem.SanitizeMol(rw_mol)
+            rw_mol = Chem.MolFromSmiles(Chem.MolToSmiles(rw_mol))
+
+            h_atoms_to_remove = [atom.GetIdx() for atom in rw_mol.GetAtoms() if atom.GetSymbol() == "*"]
+            for idx in sorted(h_atoms_to_remove, reverse=True):
+                rw_mol.ReplaceAtom(idx, Chem.Atom("H"))
+
+            c_atoms_to_remove = [atom.GetIdx() for atom in rw_mol.GetAtoms() if atom.GetSymbol() in ["[CH]", "[C@@H]", "[C@H]"]]
+            for idx in sorted(c_atoms_to_remove, reverse=True):
+                rw_mol.ReplaceAtom(idx, Chem.Atom("C"))
+
+            rw_mol.UpdatePropertyCache()
+
+            return rw_mol, both_are_bb, other_product
 
     def count_backward_transitions(self, g):
         parents_count = 0
@@ -109,8 +170,9 @@ class SynthesisSampler(Sampler):
     def sample_from_model(self, model, n, cond_info, random_action_prob=0):
 
         data = [
-            {"traj": [], "is_valid": True, "bck_a": [GraphAction(GraphActionType.Stop)], "is_sink": [], "bck_logprobs": []}
-            for _ in range(n)
+            {"traj": [], "is_valid": True, "bck_a": [GraphAction(GraphActionType.Stop)],
+             "is_sink": [], "bck_logprobs": [], "is_valid_bck": True, "bbs": []}
+            for __ in range(n)
         ]
 
         graphs = [self.env.empty_graph() for _ in range(n)]
@@ -120,13 +182,13 @@ class SynthesisSampler(Sampler):
 
             torch_graphs = [self.ctx.graph_to_Data(g, traj_len=t) for i, g in enumerate(graphs) if not done[i]]
             nx_graphs = [g for i, g in enumerate(graphs) if not done[i]]
-            not_done_mask = torch.tensor(done, device=self.device).logical_not()
 
+            not_done_mask = not torch.tensor(done, device=self.device)
             fwd_cat, *_ = model(self.ctx.collate(torch_graphs).to(self.device), cond_info[not_done_mask])
             actions = fwd_cat.sample(nx_graphs=nx_graphs, model=model, random_action_prob=random_action_prob)
             graph_actions = [self.ctx.ActionIndex_to_GraphAction(g, a, fwd=True) for g, a in zip(torch_graphs, actions)]
 
-            for i, j in zip((k for k in range(n) if not done[k]), range(n)):
+            for i, j in zip((k for k, d in enumerate(done) if not d), range(n)):
 
                 data[i]["traj"].append((graphs[i], graph_actions[j]))
 
@@ -178,6 +240,70 @@ class SynthesisSampler(Sampler):
             data[i]["bck_logprobs"] = torch.stack(data[i]["bck_logprobs"]).reshape(-1)
 
         return data
+    
+    def sample_backward_from_graphs(self, model, graphs, cond_info, random_action_prob=0):
+
+        data = [
+            {"traj": [(g, GraphAction(GraphActionType.Stop))]*2, "is_valid": True, "bck_a": [GraphAction(GraphActionType.Stop)],
+            "is_sink": [True]*2, "bck_logprobs": [], "result": g, "is_valid_bck": True, "bbs": []}
+            for g in graphs
+        ]
+
+        done = [False] * len(graphs)
+
+        for t in range(self.max_len):
+
+            torch_graphs = [self.ctx.graph_to_Data(g, traj_len=t) for i, g in enumerate(graphs) if not done[i]]
+
+            masks_sum = [torch.sum(g.bck_react_uni_mask) \
+                       + torch.sum(g.bck_react_bi_mask) \
+                       + torch.sum(g.bck_remove_first_reactant_mask)
+                            for g in torch_graphs
+            ]
+
+            not_done_mask = not torch.tensor(done, device=self.device)
+            _, bck_cat, _ = model(self.ctx.collate(torch_graphs).to(self.device), cond_info[not_done_mask])
+            actions = bck_cat.sample(random_action_prob=random_action_prob)
+            graph_actions = [self.ctx.ActionIndex_to_GraphAction(g, a, fwd=False) for g, a in zip(torch_graphs, actions)]
+
+            for i, j in zip((k for k, d in enumerate(done) if not d), range(len(graphs))):
+
+                if masks_sum[j] == 0:  # we are stuck
+                    data[i]["is_valid_bck"] = False
+                    done[i] = True
+                    continue
+
+                b_a = graph_actions[j]
+                gp, both_are_bb, bb_idx = self.env.backward_step(graphs[i], b_a)
+                b_a.bb = both_are_bb
+
+                data[i]["traj"].append((graphs[i], GraphAction(GraphActionType.ReactUni, rxn=0)))
+                data[i]["bck_a"].append(b_a)
+                data[i]["bck_logprobs"].append(torch.tensor([1.0], device=self.device).log())  # (placeholder)
+                data[i]["is_sink"].append(False)
+
+                if bb_idx:
+                    data[i]["bbs"].append(bb_idx)
+
+                if b_a.action == GraphActionType.BckRemoveFirstReactant:
+                    data[i]["bbs"].append(self.ctx.building_blocks.index(Chem.MolToSmiles(self.ctx.graph_to_obj(graphs[i]))))
+
+                graphs[i] = self.ctx.obj_to_graph(gp) if gp else self.env.empty_graph()
+
+                if len(graphs[i]) == 0:
+                    done[i] = True
+
+        for i, __ in enumerate(graphs):
+
+            if data[i]["bck_a"][-1].action != GraphActionType.BckRemoveFirstReactant:
+                data[i]["is_valid_bck"] == False
+
+            data[i]["traj"] = data[i]["traj"][::-1]
+            data[i]["bck_a"] = [GraphAction(GraphActionType.Stop)] + data[i]["bck_a"][::-1]
+            data[i]["is_sink"] = data[i]["is_sink"][::-1]
+            data[i]["bck_logprobs"] = torch.stack(data[i]["bck_logprobs"]).reshape(-1)[::-1]
+
+        return data
 
 
 class TrajectoryBalanceBase:
@@ -187,12 +313,6 @@ class TrajectoryBalanceBase:
         self.sampler = sampler
         self.device = device
         self.preference_strength = preference_strength
-
-    def create_training_data_from_own_samples(self, model, n, cond_info, random_action_prob=0.0):
-
-        cond_info = cond_info.to(self.device)
-        data = self.sampler.sample_from_model(model, n, cond_info, random_action_prob)
-        return data
 
     def construct_batch(self, trajs):
 
@@ -216,6 +336,7 @@ class TrajectoryBalanceBase:
         batch.log_p_B = torch.cat([i["bck_logprobs"] for i in trajs], 0)
         batch.is_sink = torch.tensor(sum([i["is_sink"] for i in trajs], []))
         batch.log_bbs_cost = torch.log(torch.stack([t["bbs_cost"] for t in trajs]))
+        batch.from_p_b = torch.tensor([i.get("from_p_b", False) for i in trajs])
         batch.bck_actions = [
             self.ctx.GraphAction_to_ActionIndex(g, a, fwd=False)
             for g, a in zip(torch_graphs, [i for tj in trajs for i in tj["bck_a"]])
@@ -230,12 +351,18 @@ class TrajectoryBalanceBase:
         raise NotImplementedError()
 
 class DataSource(IterableDataset):
-    def __init__(self, ctx, algo, task):
+    def __init__(self, ctx, algo, task, use_replay=False):
 
         self.iterators = []
         self.ctx = ctx
         self.algo = algo
         self.task = task
+
+        if use_replay:
+            self.replay_buffer = torch.tensor([None] * REPLAY_BUFFER_LEN)
+            self.replay_end, self.replay_saturated = 0, False
+        
+        self.use_replay = use_replay
 
     def __iter__(self):
 
@@ -260,11 +387,55 @@ class DataSource(IterableDataset):
                     "encoding": torch.zeros((num_samples, 32))
                 }
 
-                trajs = self.algo.create_training_data_from_own_samples(model, num_samples, cond_info["encoding"], 0)
+                cond_info_encoding = cond_info["encoding"].to(self.device)
+                trajs = self.algo.sampler.sample_from_model(model, num_samples, cond_info_encoding, 0)
+
+                for i in range(len(trajs)):
+                        trajs[i]["cond_info"] = {k: cond_info[k][i] for k in cond_info}
+                        trajs[i]["bbs_cost"] = sum(self.ctx.bbs_costs[bb] for bb in trajs[i]["bbs"])
+                        trajs[i]["from_p_b"] = torch.tensor([False])
+
+                self.compute_properties(trajs)
+                self.compute_log_rewards(trajs)
+
+                if self.use_replay:
+
+                    for i in range(len(trajs)):
+
+                        if not trajs[i].get("is_valid", True):
+                            continue
+
+                        self.replay_buffer[self.replay_end] = trajs[i]["result"]
+                        self.replay_end += 1
+
+                        if self.replay_end >= REPLAY_BUFFER_LEN:
+                            self.replay_saturated = True
+                            self.replay_end = 0
+
+                yield trajs[:num_samples]
+
+        self.iterators.append(iterator)
+
+    def do_sample_backward(self, model, num_samples):
+
+        def iterator():
+            while True:
+
+                max_idx = REPLAY_BUFFER_LEN if self.replay_saturated else self.replay_end
+                idxs = torch.randint(0, max_idx, (num_samples,))
+
+                cond_info = {
+                    "beta": torch.tensor(np.array(32).repeat(num_samples).astype(np.float32)),
+                    "encoding": torch.zeros((num_samples, 32))
+                }
+
+                cond_info_encoding = cond_info["encoding"].to(self.device)
+                trajs = self.algo.sampler.sample_backward_from_graphs(model, self.replay_buffer[idxs], cond_info_encoding, 0)
 
                 for i in range(len(trajs)):
                     trajs[i]["cond_info"] = {k: cond_info[k][i] for k in cond_info}
                     trajs[i]["bbs_cost"] = sum(self.ctx.bbs_costs[bb] for bb in trajs[i]["bbs"])
+                    trajs[i]["from_p_b"] = torch.tensor([True])
 
                 self.compute_properties(trajs)
                 self.compute_log_rewards(trajs)
@@ -275,7 +446,7 @@ class DataSource(IterableDataset):
 
     def compute_properties(self, trajs):
 
-        valid_idcs = torch.tensor([i for i in range(len(trajs)) if trajs[i].get("is_valid", True)]).long()
+        valid_idcs = torch.tensor([i for i in range(len(trajs)) if trajs[i].get("is_valid", True)]).long() 
         objs = [self.ctx.graph_to_obj(trajs[i]["result"]) for i in valid_idcs]
         obj_props = self.task.compute_obj_properties(objs)
 

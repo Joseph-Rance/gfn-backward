@@ -3,14 +3,16 @@ import pickle
 import os
 import time
 import numpy as np
+from scipy.spatial.distance import pdist
 import torch
 from rdkit.Chem.Scaffolds import MurckoScaffold
+from rdkit.Chem import AllChem
 
 from synflownet.envs.synthesis_building_env import ReactionTemplateEnvContext
 
-from synflownet.tasks.n_model import GraphTransformerSynGFN
-from synflownet.tasks.algs import TrajectoryBalanceUniform
-from synflownet.tasks.util import ReactionTask, ReactionTemplateEnv, SynthesisSampler, DataSource
+from back_gfn.tasks.n_model import GraphTransformerSynGFN
+from back_gfn.tasks.algs import TrajectoryBalanceUniform
+from back_gfn.tasks.util import ReactionTask, ReactionTemplateEnv, SynthesisSampler, DataSource
 
 
 DEVICE = "cuda"
@@ -20,9 +22,13 @@ PREFERENCE_STRENGTH = 0  # TODO: test with >0
 ALGO = TrajectoryBalanceUniform  # TODO: test the other algorithms
 PARAMETERISE_P_B = False
 OUTS = 1  # 2 for MaxEnt
-
+CHECKPOINT_EVERY = 5
 
 if __name__ == "__main__":
+
+    os.mkdir("results")
+    os.mkdir("results/models")
+    os.mkdir("results/batches")
 
     rel_path = "/".join(os.path.abspath(__file__).split("/")[:-2])
 
@@ -46,7 +52,7 @@ if __name__ == "__main__":
         strict_bck_masking=False
     )
     env = ReactionTemplateEnv(ctx)  # for actions
-    sampler = SynthesisSampler(ctx, env)  # for sampling policies
+    sampler = SynthesisSampler(ctx, env, DEVICE)  # for sampling policies
     algo = ALGO(ctx, sampler, DEVICE, PREFERENCE_STRENGTH)  # for computing loss / helps making batches
     model = GraphTransformerSynGFN(ctx, do_bck=PARAMETERISE_P_B, outs=OUTS)
 
@@ -64,13 +70,16 @@ if __name__ == "__main__":
     with torch.no_grad():
         train_src = DataSource(ctx, algo, task)  # gets training data inc rewards
         train_src.do_sample_model(model, 64)
+        train_src.do_sample_backward(model, 64)
         train_dl = torch.utils.data.DataLoader(train_src, batch_size=None)
 
     unique_scaffolds = set()
     num_unique_scaffolds = [0]
     num_mols_tested = [0]
 
-    full_results = [[] for __ in range(6)]
+    mean_tanimoto_distances = []
+
+    full_results = [[] for __ in range(7)]
 
     start_time = time.time()
 
@@ -107,12 +116,16 @@ if __name__ == "__main__":
             num_mols_tested.append(num_mols_tested[-1] + len(mols))
             num_unique_scaffolds.append(len(unique_scaffolds))
 
-            np.save("unique_scaffolds.npy", list(zip(num_mols_tested, num_unique_scaffolds)))
+            np.save("results/unique_scaffolds.npy", list(zip(num_mols_tested, num_unique_scaffolds)))
+
+            fps = np.array([np.array(AllChem.GetMorganFingerprintAsBitVect(mol, 2, nBits=2000)) for mol in mols])
+            mean_tanimoto_dist = np.mean(pdist(fps, metric="jaccard"))
+            mean_tanimoto_distances.append(mean_tanimoto_dist)
+
+            np.save("results/tanimoto_distances.npy", mean_tanimoto_distances)
 
             total_time = time.time() - start_time
             start_time = time.time()
-
-            # TODON: log/save trajectory bb costs
 
             if it % PRINT_EVERY == 0:
                 print(f"iteration {it} : loss:{info['loss']:7.3f} " \
@@ -120,7 +133,9 @@ if __name__ == "__main__":
                     f"time_spent:{total_time:4.2f} " \
                     f"logZ:{info['log_z']:7.4f} " \
                     f"gen scaffolds: {len(scaffolds_above_thresh)} " \
-                    f"unique scaffolds: {len(unique_scaffolds)}")
+                    f"unique scaffolds: {len(unique_scaffolds)}" \
+                    f"Tanimoto: {mean_tanimoto_dist} " \
+                    f"mean synth. cost: {batch.log_bbs_cost.exp().mean().item()}")
 
             full_results[0].append(info["loss"])
             full_results[1].append(rewards.mean().item())
@@ -128,9 +143,12 @@ if __name__ == "__main__":
             full_results[3].append(info["log_z"])
             full_results[4].append(len(scaffolds_above_thresh))
             full_results[5].append(len(unique_scaffolds))
-            np.save("full_results.npy", full_results)
+            full_results[6].append(batch.log_bbs_cost.exp().mean().item())
+            np.save("results/results.npy", full_results)
 
-            # TODON: save checkpoints + molecules to wandb
+            if it % CHECKPOINT_EVERY == 0:
+                torch.save(model.state_dict(), f"results/models/{it}.pt")
+                np.save(f"results/batches/{it}.npy", np.array([batch], dtype=object), allow_pickle=True)
 
     # TODO: does this fix memory leak?
     del batch
