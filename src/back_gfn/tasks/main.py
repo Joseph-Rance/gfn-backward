@@ -1,6 +1,7 @@
 from itertools import cycle
 import pickle
 import os
+from shutil import rmtree
 import time
 import numpy as np
 from scipy.spatial.distance import pdist
@@ -23,12 +24,14 @@ ALGO = TrajectoryBalanceUniform  # TODO: test the other algorithms
 PARAMETERISE_P_B = False
 OUTS = 1  # 2 for MaxEnt
 CHECKPOINT_EVERY = 5
+SAMPLE_BACKWARD = False  # True for REINFORCE
 
 if __name__ == "__main__":
 
-    os.mkdir("results")
-    os.mkdir("results/models")
-    os.mkdir("results/batches")
+    rmtree("back_gfn/results", ignore_errors=True)
+    os.mkdir("back_gfn/results")
+    os.mkdir("back_gfn/results/models")
+    os.mkdir("back_gfn/results/batches")
 
     rel_path = "/".join(os.path.abspath(__file__).split("/")[:-2])
 
@@ -42,7 +45,7 @@ if __name__ == "__main__":
         precomputed_bb_masks = pickle.load(f)
 
     task = ReactionTask(DEVICE)  # for reward
-    ctx = ReactionTemplateEnvContext(  # deals with molecules
+    ctx = ReactionTemplateEnvContext(  # deals with molecules  # TODO: change line 55 to actually work
         num_cond_dim=task.num_cond_dim,
         building_blocks=building_blocks,
         reaction_templates=reaction_templates,
@@ -68,9 +71,12 @@ if __name__ == "__main__":
     model.to(DEVICE)
 
     with torch.no_grad():
-        train_src = DataSource(ctx, algo, task)  # gets training data inc rewards
+        train_src = DataSource(ctx, algo, task, DEVICE, use_replay=SAMPLE_BACKWARD)  # gets training data inc rewards
+
         train_src.do_sample_model(model, 64)
-        train_src.do_sample_backward(model, 64)
+        if SAMPLE_BACKWARD:
+            train_src.do_sample_backward(model, 64)
+
         train_dl = torch.utils.data.DataLoader(train_src, batch_size=None)
 
     unique_scaffolds = set()
@@ -116,13 +122,13 @@ if __name__ == "__main__":
             num_mols_tested.append(num_mols_tested[-1] + len(mols))
             num_unique_scaffolds.append(len(unique_scaffolds))
 
-            np.save("results/unique_scaffolds.npy", list(zip(num_mols_tested, num_unique_scaffolds)))
+            np.save("back_gfn/results/unique_scaffolds.npy", list(zip(num_mols_tested, num_unique_scaffolds)))
 
             fps = np.array([np.array(AllChem.GetMorganFingerprintAsBitVect(mol, 2, nBits=2000)) for mol in mols])
             mean_tanimoto_dist = np.mean(pdist(fps, metric="jaccard"))
             mean_tanimoto_distances.append(mean_tanimoto_dist)
 
-            np.save("results/tanimoto_distances.npy", mean_tanimoto_distances)
+            np.save("back_gfn/results/tanimoto_distances.npy", mean_tanimoto_distances)
 
             total_time = time.time() - start_time
             start_time = time.time()
@@ -133,7 +139,7 @@ if __name__ == "__main__":
                     f"time_spent:{total_time:4.2f} " \
                     f"logZ:{info['log_z']:7.4f} " \
                     f"gen scaffolds: {len(scaffolds_above_thresh)} " \
-                    f"unique scaffolds: {len(unique_scaffolds)}" \
+                    f"unique scaffolds: {len(unique_scaffolds)} " \
                     f"Tanimoto: {mean_tanimoto_dist} " \
                     f"mean synth. cost: {batch.log_bbs_cost.exp().mean().item()}")
 
@@ -144,11 +150,11 @@ if __name__ == "__main__":
             full_results[4].append(len(scaffolds_above_thresh))
             full_results[5].append(len(unique_scaffolds))
             full_results[6].append(batch.log_bbs_cost.exp().mean().item())
-            np.save("results/results.npy", full_results)
+            np.save("back_gfn/results/results.npy", full_results)
 
             if it % CHECKPOINT_EVERY == 0:
-                torch.save(model.state_dict(), f"results/models/{it}.pt")
-                np.save(f"results/batches/{it}.npy", np.array([batch], dtype=object), allow_pickle=True)
+                torch.save(model.state_dict(), f"back_gfn/results/models/{it}.pt")
+                np.save(f"back_gfn/results/batches/{it}.npy", np.array([batch], dtype=object), allow_pickle=True)
 
     # TODO: does this fix memory leak?
     del batch

@@ -165,7 +165,7 @@ class SynthesisSampler(Sampler):
         self.ctx = ctx
         self.env = env
         self.device = device
-        self.max_len = max_len if max_len is not None else 5
+        self.max_len = max_len if max_len else 5
 
     def sample_from_model(self, model, n, cond_info, random_action_prob=0):
 
@@ -183,7 +183,7 @@ class SynthesisSampler(Sampler):
             torch_graphs = [self.ctx.graph_to_Data(g, traj_len=t) for i, g in enumerate(graphs) if not done[i]]
             nx_graphs = [g for i, g in enumerate(graphs) if not done[i]]
 
-            not_done_mask = not torch.tensor(done, device=self.device)
+            not_done_mask = torch.tensor(done, device=self.device).logical_not()
             fwd_cat, *_ = model(self.ctx.collate(torch_graphs).to(self.device), cond_info[not_done_mask])
             actions = fwd_cat.sample(nx_graphs=nx_graphs, model=model, random_action_prob=random_action_prob)
             graph_actions = [self.ctx.ActionIndex_to_GraphAction(g, a, fwd=True) for g, a in zip(torch_graphs, actions)]
@@ -195,7 +195,7 @@ class SynthesisSampler(Sampler):
                 if graph_actions[j].action is GraphActionType.Stop:
 
                     data[i]["bck_a"].append(GraphAction(GraphActionType.Stop))
-                    data[i]["bck_logprobs"].append(torch.tensor([1.0], device=self.device).log())
+                    data[i]["bck_logprobs"].append(torch.tensor([1.0]).log())
                     data[i]["is_sink"].append(True)
                     done[i] = True
 
@@ -203,14 +203,21 @@ class SynthesisSampler(Sampler):
 
                     gp = self.env.step(graphs[i], graph_actions[j])
 
-                    data[i]["bck_a"].append(self.env.reverse(gp, graph_actions[j]))  # TODO: time and put behind if statement if too slow
+                    try:  # TODO: why error here so much (and can remove try?)
+                        data[i]["bck_a"].append(self.env.reverse(gp, graph_actions[j]))  # TODO: time and put behind if statement if too slow
+                    except Exception as e:
+                        data[i]["bck_a"].append(GraphAction(GraphActionType.BckReactBi, rxn=graph_actions[j].rxn, bb=0))
+                        data[i]["bck_logprobs"].append(torch.tensor([1.0]).log())
+                        data[i]["is_sink"].append(True)
+                        done[i] = True
+                        data[i]["is_valid"] = False
+                        continue
 
                     Chem.SanitizeMol(gp)
                     g = self.ctx.obj_to_graph(gp)
 
                     n_back = self.env.count_backward_transitions(g)  # TODO: time and put behind if statement if too slow
-                    data[i]["bck_logprobs"].append(torch.tensor([1 / n_back] if n_back > 0 else [0.001],
-                                                                device=self.device).log())
+                    data[i]["bck_logprobs"].append(torch.tensor([1 / n_back] if n_back > 0 else [0.001]).log())
 
                     # in original implementation this is set to True for t = max_len-1
                     data[i]["is_sink"].append(False)
@@ -237,6 +244,8 @@ class SynthesisSampler(Sampler):
 
             data[i]["traj"].append((graphs[i], GraphAction(GraphActionType.Stop)))
             data[i]["is_sink"].append(True)
+            data[i]["bck_logprobs"].append(torch.tensor([1.0]).log())
+
             data[i]["bck_logprobs"] = torch.stack(data[i]["bck_logprobs"]).reshape(-1)
 
         return data
@@ -245,7 +254,7 @@ class SynthesisSampler(Sampler):
 
         data = [
             {"traj": [(g, GraphAction(GraphActionType.Stop))]*2, "is_valid": True, "bck_a": [GraphAction(GraphActionType.Stop)],
-            "is_sink": [True]*2, "bck_logprobs": [], "result": g, "is_valid_bck": True, "bbs": []}
+            "is_sink": [True]*2, "bck_logprobs": [torch.tensor([1.0]).log()]*2, "result": g, "is_valid_bck": True, "bbs": []}
             for g in graphs
         ]
 
@@ -261,7 +270,7 @@ class SynthesisSampler(Sampler):
                             for g in torch_graphs
             ]
 
-            not_done_mask = not torch.tensor(done, device=self.device)
+            not_done_mask = torch.tensor(done, device=self.device).logical_not()
             _, bck_cat, _ = model(self.ctx.collate(torch_graphs).to(self.device), cond_info[not_done_mask])
             actions = bck_cat.sample(random_action_prob=random_action_prob)
             graph_actions = [self.ctx.ActionIndex_to_GraphAction(g, a, fwd=False) for g, a in zip(torch_graphs, actions)]
@@ -279,7 +288,7 @@ class SynthesisSampler(Sampler):
 
                 data[i]["traj"].append((graphs[i], GraphAction(GraphActionType.ReactUni, rxn=0)))
                 data[i]["bck_a"].append(b_a)
-                data[i]["bck_logprobs"].append(torch.tensor([1.0], device=self.device).log())  # (placeholder)
+                data[i]["bck_logprobs"].append(torch.tensor([1.0]).log())  # (placeholder)
                 data[i]["is_sink"].append(False)
 
                 if bb_idx:
@@ -301,6 +310,7 @@ class SynthesisSampler(Sampler):
             data[i]["traj"] = data[i]["traj"][::-1]
             data[i]["bck_a"] = [GraphAction(GraphActionType.Stop)] + data[i]["bck_a"][::-1]
             data[i]["is_sink"] = data[i]["is_sink"][::-1]
+
             data[i]["bck_logprobs"] = torch.stack(data[i]["bck_logprobs"]).reshape(-1)[::-1]
 
         return data
@@ -343,7 +353,7 @@ class TrajectoryBalanceBase:
         ]
 
         # TODO: try better methods of combining the reward
-        batch.log_rewards -= batch.log_bbs_cost * self.preference_strength
+        batch.log_rewards -= batch.log_bbs_cost[:, 0] * self.preference_strength
 
         return batch
 
@@ -351,12 +361,14 @@ class TrajectoryBalanceBase:
         raise NotImplementedError()
 
 class DataSource(IterableDataset):
-    def __init__(self, ctx, algo, task, use_replay=False):
+    def __init__(self, ctx, algo, task, device, use_replay=False):
 
         self.iterators = []
         self.ctx = ctx
         self.algo = algo
         self.task = task
+
+        self.device = device
 
         if use_replay:
             self.replay_buffer = torch.tensor([None] * REPLAY_BUFFER_LEN)
@@ -392,7 +404,7 @@ class DataSource(IterableDataset):
 
                 for i in range(len(trajs)):
                         trajs[i]["cond_info"] = {k: cond_info[k][i] for k in cond_info}
-                        trajs[i]["bbs_cost"] = sum(self.ctx.bbs_costs[bb] for bb in trajs[i]["bbs"])
+                        trajs[i]["bbs_cost"] = torch.tensor([sum(self.ctx.bbs_costs[bb] for bb in trajs[i]["bbs"])])
                         trajs[i]["from_p_b"] = torch.tensor([False])
 
                 self.compute_properties(trajs)
@@ -434,7 +446,7 @@ class DataSource(IterableDataset):
 
                 for i in range(len(trajs)):
                     trajs[i]["cond_info"] = {k: cond_info[k][i] for k in cond_info}
-                    trajs[i]["bbs_cost"] = sum(self.ctx.bbs_costs[bb] for bb in trajs[i]["bbs"])
+                    trajs[i]["bbs_cost"] = torch.tensor([sum(self.ctx.bbs_costs[bb] for bb in trajs[i]["bbs"])])
                     trajs[i]["from_p_b"] = torch.tensor([True])
 
                 self.compute_properties(trajs)

@@ -11,8 +11,8 @@ class TrajectoryBalancePref(TrajectoryBalanceBase):
 
     def compute_batch_losses(self, model, batch):
 
-        forward_log_Z = model.logZ(batch.cond_info[not batch.from_p_b])[:, 0]
-        forward_clipped_log_R = torch.maximum(batch.log_rewards[not batch.from_p_b], torch.tensor(-75, device=self.device)).float()
+        forward_log_Z = model.logZ(batch.cond_info[batch.from_p_b.logical_not()])[:, 0]
+        forward_clipped_log_R = torch.maximum(batch.log_rewards[batch.from_p_b.logical_not()], torch.tensor(-75, device=self.device)).float()
 
         batch_idx = torch.arange(batch.traj_lens.shape[0], device=self.device).repeat_interleave(batch.traj_lens)
         fwd_cat, bck_cat, _per_graph_out = model(batch, batch.cond_info[batch_idx])
@@ -20,7 +20,7 @@ class TrajectoryBalancePref(TrajectoryBalanceBase):
             fwd_cat.set_secondary_masks(atype, idcs, mask)
 
         p_b_mask = batch.from_p_b.to(self.device).repeat_interleave(batch.traj_lens)
-        log_p_F = fwd_cat.log_prob(batch.actions, batch.nx_graphs, model)[not p_b_mask]
+        log_p_F = fwd_cat.log_prob(batch.actions, batch.nx_graphs, model)[p_b_mask.logical_not()]
         log_p_B = bck_cat.log_prob(batch.bck_actions)
 
         final_graph_idx = torch.cumsum(batch.traj_lens, 0) - 1
@@ -40,7 +40,7 @@ class TrajectoryBalancePref(TrajectoryBalanceBase):
 
         traj_log_p_B = traj_log_p_B.detach()
 
-        traj_diffs = (forward_log_Z + traj_log_p_F[not batch.from_p_b]) - (forward_clipped_log_R + traj_log_p_B[not batch.from_p_b])
+        traj_diffs = (forward_log_Z + traj_log_p_F[batch.from_p_b.logical_not()]) - (forward_clipped_log_R + traj_log_p_B[batch.from_p_b.logical_not()])
         tb_loss = (traj_diffs * traj_diffs).mean()  # train p_F with p_B from prev. iteration
                                                     # (slightly different from algorithm 1 in the paper)
 
@@ -48,8 +48,8 @@ class TrajectoryBalancePref(TrajectoryBalanceBase):
 
         info = {
             "log_z": forward_log_Z.mean().item(),
-            "log_p_f": traj_log_p_F[not batch.from_p_b].mean().item(),
-            "log_p_b": traj_log_p_B[not batch.from_p_b].mean().item(),
+            "log_p_f": traj_log_p_F[batch.from_p_b.logical_not()].mean().item(),
+            "log_p_b": traj_log_p_B[batch.from_p_b.logical_not()].mean().item(),
             "log_r": forward_clipped_log_R.mean().item(),
             "tb_loss": tb_loss.item(),
             "p_b_loss": p_B_loss.item(),
@@ -73,6 +73,14 @@ class TrajectoryBalanceUniform(TrajectoryBalanceBase):
 
         log_p_F = fwd_cat.log_prob(batch.actions, batch.nx_graphs, model)
         log_p_B = batch.log_p_B
+
+        final_graph_idx = torch.cumsum(batch.traj_lens, 0) - 1
+
+        # don't count padding states on forward (kind of wasteful to compute these)
+        log_p_F[final_graph_idx] = 0
+
+        # don't count starting states or consecutive sinks (due to padding) on backward
+        log_p_B = torch.roll(log_p_B, -1, 0)
 
         traj_log_p_F = scatter(log_p_F, batch_idx, dim=0, dim_size=batch.traj_lens.shape[0], reduce="sum")
         traj_log_p_B = scatter(log_p_B, batch_idx, dim=0, dim_size=batch.traj_lens.shape[0], reduce="sum")

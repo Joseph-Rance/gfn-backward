@@ -95,7 +95,7 @@ class GraphTransformerSynGFN(nn.Module):
 
         self._ae = [env_ctx.building_blocks_embs.to(DEVICE)]
 
-    def _make_cat(self, g, emb, action_types, fwd=False):
+    def _make_cat(self, g, emb, action_types, fwd=True):
 
         raw_logits = []
         for t in action_types:
@@ -110,7 +110,7 @@ class GraphTransformerSynGFN(nn.Module):
             g,
             emb["graph"],
             raw_logits=raw_logits,
-            keys=[self._action_type_to_key[t] for t in action_types if self._action_type_to_key[t] is not None],
+            keys=[self._action_type_to_key[t] for t in action_types if self._action_type_to_key[t]],
             action_masks=[action_type_to_mask(t, g) for t in action_types],
             types=action_types,
             fwd=fwd,
@@ -141,7 +141,7 @@ class GraphTransformerSynGFN(nn.Module):
         action_type_order = [x for x in self.action_type_order if x != GraphActionType.AddReactant]
         bck_action_type_order = self.bck_action_type_order
 
-        fwd_cat = self._make_cat(g, emb, action_type_order)
+        fwd_cat = self._make_cat(g, emb, action_type_order, fwd=True)
 
         if self.do_bck:
             bck_cat = self._make_cat(g, emb, bck_action_type_order, fwd=False)
