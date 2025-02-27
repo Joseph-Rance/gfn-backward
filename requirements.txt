@@ -1,1 +1,2 @@
+torch-discounted-cumsum
 -e git+https://github.com/mirunacrt/synflownet.git@46a4acabd2255eb964c317ffbb86b743a13a4685#egg=synflownet --find-links https://data.pyg.org/whl/torch-2.1.2+cu121.html

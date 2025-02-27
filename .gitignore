@@ -9,3 +9,4 @@ src/back_gfn/data/building_blocks/short_building_blocks_subsampled_10000.txt
 src/back_gfn/data/building_blocks/unique_bbs.txt
 src/back_gfn/data/building_blocks/precomputed_bb_masks_enamine_bbs.pkl
 src/back_gfn/data/building_blocks/bbs.txt
+src/back_gfn/results/*
