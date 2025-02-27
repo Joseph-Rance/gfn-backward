@@ -160,12 +160,14 @@ class ReactionTemplateEnv:
 
 class SynthesisSampler(Sampler):
 
-    def __init__(self, ctx, env, device, max_len=None):
+    def __init__(self, ctx, env, device, record_back_actions=False, record_uniform_probs=False, max_len=None):
 
         self.ctx = ctx
         self.env = env
         self.device = device
-        self.max_len = max_len if max_len else 5
+        self.record_back_actions = record_back_actions
+        self.record_uniform_probs = record_uniform_probs
+        self.max_len = max_len if max_len else 3
 
     def sample_from_model(self, model, n, cond_info, random_action_prob=0):
 
@@ -203,21 +205,33 @@ class SynthesisSampler(Sampler):
 
                     gp = self.env.step(graphs[i], graph_actions[j])
 
-                    try:  # TODO: why error here so much (and can remove try?)
-                        data[i]["bck_a"].append(self.env.reverse(gp, graph_actions[j]))  # TODO: time and put behind if statement if too slow
+                    if self.record_back_actions:
+                        try:
+                            data[i]["bck_a"].append(self.env.reverse(gp, graph_actions[j]))
+                        except Exception as e:
+                            data[i]["bck_a"].append(GraphAction(GraphActionType.BckReactBi, rxn=graph_actions[j].rxn, bb=0))
+                            data[i]["bck_logprobs"].append(torch.tensor([1.0]).log())
+                            data[i]["is_sink"].append(True)
+                            done[i] = True
+                            data[i]["is_valid"] = False
+                            continue
+
+                    try:
+                        Chem.SanitizeMol(gp)
                     except Exception as e:
-                        data[i]["bck_a"].append(GraphAction(GraphActionType.BckReactBi, rxn=graph_actions[j].rxn, bb=0))
                         data[i]["bck_logprobs"].append(torch.tensor([1.0]).log())
                         data[i]["is_sink"].append(True)
                         done[i] = True
                         data[i]["is_valid"] = False
                         continue
 
-                    Chem.SanitizeMol(gp)
                     g = self.ctx.obj_to_graph(gp)
 
-                    n_back = self.env.count_backward_transitions(g)  # TODO: time and put behind if statement if too slow
-                    data[i]["bck_logprobs"].append(torch.tensor([1 / n_back] if n_back > 0 else [0.001]).log())
+                    if self.record_uniform_probs:
+                        n_back = self.env.count_backward_transitions(g)  # this is a surprisingly slow function
+                        data[i]["bck_logprobs"].append(torch.tensor([1 / n_back] if n_back > 0 else [0.001]).log())
+                    else:
+                        data[i]["bck_logprobs"].append(torch.tensor([0.001]).log())
 
                     # in original implementation this is set to True for t = max_len-1
                     data[i]["is_sink"].append(False)
@@ -225,6 +239,8 @@ class SynthesisSampler(Sampler):
                     if graph_actions[j].action in [GraphActionType.AddFirstReactant,
                                                    GraphActionType.ReactBi]:
                         data[i]["bbs"].append(graph_actions[j].bb)
+                    else:
+                        data[i]["bbs"].append(None)
 
                     if t == self.max_len - 1:
                         done[i] = True
@@ -245,16 +261,18 @@ class SynthesisSampler(Sampler):
             data[i]["traj"].append((graphs[i], GraphAction(GraphActionType.Stop)))
             data[i]["is_sink"].append(True)
             data[i]["bck_logprobs"].append(torch.tensor([1.0]).log())
+            data[i]["bbs"].append(None)
 
             data[i]["bck_logprobs"] = torch.stack(data[i]["bck_logprobs"]).reshape(-1)
 
         return data
     
     def sample_backward_from_graphs(self, model, graphs, cond_info, random_action_prob=0):
+        # sample end state randomly from the replay buffer. Could also sample from a buffer of old backward trajectories.
 
         data = [
             {"traj": [(g, GraphAction(GraphActionType.Stop))]*2, "is_valid": True, "bck_a": [GraphAction(GraphActionType.Stop)],
-            "is_sink": [True]*2, "bck_logprobs": [torch.tensor([1.0]).log()]*2, "result": g, "is_valid_bck": True, "bbs": []}
+            "is_sink": [True]*2, "bck_logprobs": [torch.tensor([1.0]).log()]*2, "result": g, "is_valid_bck": True, "bbs": [None]*2}
             for g in graphs
         ]
 
@@ -284,6 +302,7 @@ class SynthesisSampler(Sampler):
 
                 b_a = graph_actions[j]
                 gp, both_are_bb, bb_idx = self.env.backward_step(graphs[i], b_a)
+                graphs[i] = self.ctx.obj_to_graph(gp) if gp else self.env.empty_graph()
                 b_a.bb = both_are_bb
 
                 data[i]["traj"].append((graphs[i], GraphAction(GraphActionType.ReactUni, rxn=0)))
@@ -291,13 +310,12 @@ class SynthesisSampler(Sampler):
                 data[i]["bck_logprobs"].append(torch.tensor([1.0]).log())  # (placeholder)
                 data[i]["is_sink"].append(False)
 
-                if bb_idx:
-                    data[i]["bbs"].append(bb_idx)
-
                 if b_a.action == GraphActionType.BckRemoveFirstReactant:
                     data[i]["bbs"].append(self.ctx.building_blocks.index(Chem.MolToSmiles(self.ctx.graph_to_obj(graphs[i]))))
-
-                graphs[i] = self.ctx.obj_to_graph(gp) if gp else self.env.empty_graph()
+                elif bb_idx:
+                    data[i]["bbs"].append(bb_idx)
+                else:
+                    data[i]["bbs"].append(None)
 
                 if len(graphs[i]) == 0:
                     done[i] = True
@@ -308,6 +326,7 @@ class SynthesisSampler(Sampler):
                 data[i]["is_valid_bck"] == False
 
             data[i]["traj"] = data[i]["traj"][::-1]
+            data[i]["bbs"] = data[i]["bbs"][::-1]
             data[i]["bck_a"] = [GraphAction(GraphActionType.Stop)] + data[i]["bck_a"][::-1]
             data[i]["is_sink"] = data[i]["is_sink"][::-1]
 
@@ -318,7 +337,7 @@ class SynthesisSampler(Sampler):
 
 class TrajectoryBalanceBase:
 
-    def __init__(self, ctx, sampler, device, preference_strength=0):
+    def __init__(self, ctx, sampler, device, preference_strength=0, **_kwargs):
         self.ctx = ctx
         self.sampler = sampler
         self.device = device
@@ -345,15 +364,14 @@ class TrajectoryBalanceBase:
         batch.secondary_masks = self.ctx.precompute_secondary_masks(batch.actions, batch.nx_graphs)
         batch.log_p_B = torch.cat([i["bck_logprobs"] for i in trajs], 0)
         batch.is_sink = torch.tensor(sum([i["is_sink"] for i in trajs], []))
-        batch.log_bbs_cost = torch.log(torch.stack([t["bbs_cost"] for t in trajs]))
+        batch.bbs_costs = [t["bbs_costs"] for t in trajs]
         batch.from_p_b = torch.tensor([i.get("from_p_b", False) for i in trajs])
         batch.bck_actions = [
             self.ctx.GraphAction_to_ActionIndex(g, a, fwd=False)
             for g, a in zip(torch_graphs, [i for tj in trajs for i in tj["bck_a"]])
         ]
 
-        # TODO: try better methods of combining the reward
-        batch.log_rewards -= batch.log_bbs_cost[:, 0] * self.preference_strength
+        batch.log_rewards -= torch.tensor([i.sum().item() for i in batch.bbs_costs]) * self.preference_strength
 
         return batch
 
@@ -403,9 +421,9 @@ class DataSource(IterableDataset):
                 trajs = self.algo.sampler.sample_from_model(model, num_samples, cond_info_encoding, 0)
 
                 for i in range(len(trajs)):
-                        trajs[i]["cond_info"] = {k: cond_info[k][i] for k in cond_info}
-                        trajs[i]["bbs_cost"] = torch.tensor([sum(self.ctx.bbs_costs[bb] for bb in trajs[i]["bbs"])])
-                        trajs[i]["from_p_b"] = torch.tensor([False])
+                    trajs[i]["cond_info"] = {k: cond_info[k][i] for k in cond_info}
+                    trajs[i]["bbs_costs"] = torch.tensor([(self.ctx.bbs_costs[bb] if bb is not None else 0) for bb in trajs[i]["bbs"]])
+                    trajs[i]["from_p_b"] = torch.tensor([False])
 
                 self.compute_properties(trajs)
                 self.compute_log_rewards(trajs)
@@ -446,7 +464,7 @@ class DataSource(IterableDataset):
 
                 for i in range(len(trajs)):
                     trajs[i]["cond_info"] = {k: cond_info[k][i] for k in cond_info}
-                    trajs[i]["bbs_cost"] = torch.tensor([sum(self.ctx.bbs_costs[bb] for bb in trajs[i]["bbs"])])
+                    trajs[i]["bbs_costs"] = [(self.ctx.bbs_costs[bb] if bb is not None else 0) for bb in trajs[i]["bbs"]]
                     trajs[i]["from_p_b"] = torch.tensor([True])
 
                 self.compute_properties(trajs)
